@@ -26,6 +26,10 @@
 #include "native/core/vm.h"
 #include "native/dev/dev.h"
 
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 /* HAKUX_APU_STATS=1 -> 1 Hz hakuX-apu line (audio evidence) */
 static bool g_apu_stats;
 static int g_apu_fifo_min = INT_MAX, g_apu_fifo_max;
@@ -73,6 +77,22 @@ bool apu_cond_timedwait_ms(pthread_cond_t *c, pthread_mutex_t *m, int ms)
     return apu_cond_timedwait_us(c, m, (int64_t)ms * 1000);
 }
 
+struct apu_thread_boot {
+    void *(*fn)(void *);
+    void *arg;
+    int nice;
+};
+
+static void *apu_thread_tramp(void *p)
+{
+    struct apu_thread_boot b = *(struct apu_thread_boot *)p;
+    free(p);
+    if (b.nice) {
+        (void)setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), b.nice);
+    }
+    return b.fn(b.arg);
+}
+
 /* The device code was written for desktop stacks (8 MiB); bionic's default
  * is 1 MiB. */
 void apu_thread_start(pthread_t *t, const char *name, void *(*fn)(void *), void *arg, bool joinable)
@@ -80,7 +100,13 @@ void apu_thread_start(pthread_t *t, const char *name, void *(*fn)(void *), void 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 8u << 20);
-    pthread_create(t, &attr, fn, arg);
+    /* hakuX audio fix: the frame thread and the voice workers feed a
+     * real-time callback: a better priority (best effort) */
+    struct apu_thread_boot *boot = malloc(sizeof(*boot));
+    boot->fn = fn;
+    boot->arg = arg;
+    boot->nice = (!strcmp(name, "apu.frame") || !strcmp(name, "apu.voice")) ? -8 : 0;
+    pthread_create(t, &attr, apu_thread_tramp, boot);
     pthread_attr_destroy(&attr);
     char n[16];
     snprintf(n, sizeof(n), "%s", name);
@@ -533,8 +559,14 @@ static void monitor_init(MCPXAPUState *d)
     int max_high = MAX(d->monitor.fifo_capacity_bytes - fifo_frame_bytes,
                        fifo_frame_bytes);
     d->monitor.device_buffer_bytes = drain_bytes;
-    d->monitor.queued_bytes_high = MIN(3 * drain_bytes, max_high);
-    d->monitor.queued_bytes_low = MIN(drain_bytes, d->monitor.queued_bytes_high);
+    /* hakuX audio fix: 32 ms of cushion (three callbacks) ran dry whenever
+     * the frame thread was late (the big cores busy with the JIT and the
+     * renderers). NC_APU_LATENCY_MS (20-250, default 64) is the high
+     * watermark, the low one half of it; 48 frames and 4 bytes a ms. */
+    const int latency_ms = getenv_int_clamped("NC_APU_LATENCY_MS", 20, 250, 64);
+    const int high_bytes = latency_ms * 48 * 4;
+    d->monitor.queued_bytes_high = MIN(MAX(high_bytes, 3 * drain_bytes), max_high);
+    d->monitor.queued_bytes_low = MIN(MAX(high_bytes / 2, drain_bytes), d->monitor.queued_bytes_high);
 }
 
 void mcpx_apu_reset(MCPXAPUState *d)

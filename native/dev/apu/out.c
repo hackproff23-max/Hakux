@@ -29,7 +29,14 @@ static struct {
     bool started, app_paused;
     bool reopening;          /* reopen_thread runs */
     uint32_t callbacks, short_callbacks;
+    /* hakuX audio fix: the consumer's (callback or drain thread, one at a
+     * time) state to leave and enter a gap without a click */
+    int16_t last[2];         /* the last frame given out */
+    bool underrun;           /* the last callback ran short: fade the next in */
+    int32_t xruns;           /* the device's xruns seen (adaptive buffer) */
 } g_out = { .mu = PTHREAD_MUTEX_INITIALIZER };
+
+#define FADE_FRAMES 128     /* 2.7 ms at 48 kHz */
 
 int apu_out_queued(void)
 {
@@ -78,9 +85,36 @@ static void fill(uint8_t *stream, int bytes)
     }
     const int n = pop(stream, bytes);
     apu_inc(&g_out.callbacks);
-    if (n < bytes) {
+
+    /* hakuX audio fix: a gap is entered and left with a ramp. Cut to zero
+     * and back, the steps were clicks on top of the gap itself. */
+    int16_t *s = (int16_t *)stream;
+    const int frames = bytes / OUT_FRAME_BYTES;
+    const int got = n / OUT_FRAME_BYTES;
+    if (g_out.underrun && got > 0) {
+        const int m = MIN(got, FADE_FRAMES);
+        for (int i = 0; i < m; i++) {
+            s[2 * i] = (int16_t)((s[2 * i] * (i + 1)) / m);
+            s[2 * i + 1] = (int16_t)((s[2 * i + 1] * (i + 1)) / m);
+        }
+        g_out.underrun = false;
+    }
+    if (got < frames) {
         apu_inc(&g_out.short_callbacks);
-        memset(stream + n, 0, (size_t)(bytes - n));
+        const int16_t l = got ? s[2 * (got - 1)] : g_out.last[0];
+        const int16_t r = got ? s[2 * (got - 1) + 1] : g_out.last[1];
+        const int m = MIN(frames - got, FADE_FRAMES);
+        for (int i = 0; i < m; i++) {
+            s[2 * (got + i)] = (int16_t)((l * (m - 1 - i)) / m);
+            s[2 * (got + i) + 1] = (int16_t)((r * (m - 1 - i)) / m);
+        }
+        memset(stream + (got + m) * OUT_FRAME_BYTES, 0,
+               (size_t)(frames - got - m) * OUT_FRAME_BYTES);
+        g_out.underrun = true;
+    }
+    if (frames > 0) {
+        g_out.last[0] = s[2 * (frames - 1)];
+        g_out.last[1] = s[2 * (frames - 1) + 1];
     }
     pthread_cond_broadcast(g_out.wake);
 }
@@ -88,6 +122,18 @@ static void fill(uint8_t *stream, int bytes)
 static aaudio_data_callback_result_t on_data(AAudioStream *s, void *user, void *data, int32_t frames)
 {
     fill(data, frames * OUT_FRAME_BYTES);
+    /* hakuX audio fix: the device's own underruns (its buffer ran dry
+     * between callbacks): its buffer grows one burst, up to its capacity */
+    const int32_t x = AAudioStream_getXRunCount(s);
+    if (x > g_out.xruns) {
+        g_out.xruns = x;
+        const int32_t cap = AAudioStream_getBufferCapacityInFrames(s);
+        const int32_t cur = AAudioStream_getBufferSizeInFrames(s);
+        const int32_t burst = AAudioStream_getFramesPerBurst(s);
+        if (burst > 0 && cur > 0 && cur + burst <= cap) {
+            AAudioStream_setBufferSizeInFrames(s, cur + burst);
+        }
+    }
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -111,6 +157,14 @@ static AAudioStream *open_stream(aaudio_result_t *r)
         AAudioStreamBuilder_delete(b);
         if (*r != AAUDIO_OK) {
             s = NULL;
+        } else {
+            /* hakuX audio fix: the default buffer (two bursts) can be
+             * smaller than one callback of ours: two callbacks' worth */
+            const int32_t cap = AAudioStream_getBufferCapacityInFrames(s);
+            if (cap > 0) {
+                AAudioStream_setBufferSizeInFrames(s, MIN(cap, g_out.samples * 2));
+            }
+            g_out.xruns = 0;
         }
     }
     return s;

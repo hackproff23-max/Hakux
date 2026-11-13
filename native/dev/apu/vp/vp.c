@@ -2508,6 +2508,24 @@ static void idle_report(MCPXAPUState *d, const uint16_t *idle, unsigned n)
     apu_spin_unlock(&d->vp.fe_spin);
 }
 
+/* hakuX audio fix: the VP's own mix summed in float, then cut at full scale
+ * (src_float_to_short_array): many voices above 1.0 clipped hard and
+ * crackled. Up to the knee the sample passes untouched; above it a tanh
+ * curve rounds off toward full scale (same slope at the knee, no step). */
+static inline int16_t soft_limit_s16(float x)
+{
+    const float knee = 0.70f;
+    if (x != x) {
+        return 0;
+    }
+    float a = fabsf(x);
+    if (a > knee) {
+        a = knee + (1.0f - knee) * tanhf((a - knee) * (1.0f / (1.0f - knee)));
+        x = copysignf(a, x);
+    }
+    return (int16_t)lrintf(x * 32767.0f);
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
@@ -2590,13 +2608,13 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
 
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
         /* Mix all voices together to hear any audible voice */
-        int16_t isamp[NUM_SAMPLES_PER_FRAME * 2];
-        src_float_to_short_array((float *)d->vp.sample_buf, isamp,
-                                 NUM_SAMPLES_PER_FRAME * 2);
+        /* hakuX audio fix: soft limiter; assigned, not added: a slot left
+         * over (EPRST resets ep_frame_div mid-cycle) could wrap the int16 */
+        const float *sb = (const float *)d->vp.sample_buf;
         int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            d->monitor.frame_buf[off + i][0] += isamp[2*i];
-            d->monitor.frame_buf[off + i][1] += isamp[2*i+1];
+            d->monitor.frame_buf[off + i][0] = soft_limit_s16(sb[2*i]);
+            d->monitor.frame_buf[off + i][1] = soft_limit_s16(sb[2*i+1]);
         }
 
         memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
