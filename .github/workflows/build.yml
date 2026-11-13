@@ -51,7 +51,7 @@ jobs:
           git -C $D/adrenotools submodule update --init --recursive
           git -C $D/adrenotools apply $GITHUB_WORKSPACE/tools/native/adrenotools-kgsl-context-priority.patch
           git clone https://github.com/abaire/nv2a_vsh_cpu $D/root/subprojects/nv2a_vsh_cpu
-          git -C $D/root/subprojects/nv2a_vsh_cpu checkout 561fe80
+          git -C $D/root/subprojects/nv2a_vsh_cpu checkout 89315e8
           echo "NC_DEPS=$D" >> $GITHUB_ENV
 
       - name: Compilar o nucleo
